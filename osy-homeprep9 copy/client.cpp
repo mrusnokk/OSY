@@ -4,13 +4,13 @@
 #include <ctime>
 #include <cerrno>
 #include <unistd.h>
-#include <poll.h>
 #include <sys/socket.h>
 #include <pthread.h>
 #include <arpa/inet.h>
-#include <atomic>
 #include <csignal>
 #include <semaphore.h>
+
+constexpr int COOK_INTERVAL = 5; // kuchar generuje jedno jidlo za 5 vterin
 
 int soc = -1;
 static const char *jidla[] = {
@@ -32,10 +32,58 @@ bool send_cmd(const char *cmd)
     return write(soc, cmd, strlen(cmd)) >= 0;
 }
 
-void *handle_server(void *arg)
+// kuchar: kazdych 5 vterin posle jedno jidlo (pokud je na taci volno)
+void *cook_thread(void *)
 {
-    char buf[128];
+    for (;;)
+    {
+        char out[128];
+        snprintf(out, sizeof(out), "%s\n", jidla[rand() % pocet_jidel]);
+        if (!send_cmd(out))
+            break;
+        sem_wait(&sem_w); // server odpovi OK, az se jidlo vlozi na tac
+        sleep(COOK_INTERVAL);
+    }
+    return nullptr;
+}
 
+// precte radek s roli (po jednom bajtu, aby se nezkonzumovalo nic navic)
+static bool read_role(char *role, size_t len)
+{
+    size_t i = 0;
+    while (i + 1 < len)
+    {
+        char c;
+        if (read(soc, &c, 1) <= 0)
+            return false;
+        if (c == '\n')
+            break;
+        if (c != '\r')
+            role[i++] = c;
+    }
+    role[i] = '\0';
+    return true;
+}
+
+void *handle_server(void *)
+{
+    char role[32];
+    if (!read_role(role, sizeof(role)))
+        return nullptr;
+
+    printf("Moje role: %s\n", role);
+    fflush(stdout);
+
+    bool kuchar = strcmp(role, "kuchar") == 0;
+    if (kuchar)
+    {
+        pthread_t cook;
+        if (pthread_create(&cook, nullptr, cook_thread, nullptr) != 0)
+            return nullptr;
+        pthread_detach(cook);
+    }
+
+    char buf[1024];
     while (1)
     {
         ssize_t n = read(soc, buf, sizeof(buf) - 1);
@@ -43,54 +91,36 @@ void *handle_server(void *arg)
             break;
 
         buf[n] = '\0';
-        if (strncmp(buf, "OK", 2) == 0)
+        if (kuchar)
         {
-            sem_post(&sem_w);
+            if (strncmp(buf, "OK", 2) == 0)
+                sem_post(&sem_w);
         }
-        else if (strncmp("Role?", buf, 5) != 0)
+        else
         {
+            // navstevnik dostal tac
+            printf("%s\n", buf);
+            fflush(stdout);
             send_cmd("OK\n");
         }
-        printf("%s\n", buf);
     }
     return nullptr;
 }
 
-void *handle_console(void *arg)
+void *handle_console(void *)
 {
-
     char line[128];
     while (fgets(line, sizeof(line), stdin))
     {
         line[strcspn(line, "\r\n")] = '\0';
 
-        if (line[0] == '\0')
-            continue;
-
-        const char *cmd = nullptr;
-
-        int pocet = atoi(line);
-
-        for (int i = 0; i < pocet; i++)
-        {
-            char out[128];
-            snprintf(out, sizeof(out), "%s\n", jidla[rand() % pocet_jidel]);
-            send_cmd(out);
-            sem_wait(&sem_w);
-        }
-        if (pocet == 0)
-        {
-            char out[128];
-            snprintf(out, sizeof(out), "%s\n", line);
-            send_cmd(out);
-        }
-
         if (strcmp(line, "QUIT") == 0)
         {
+            send_cmd("QUIT\n");
+            shutdown(soc, SHUT_RDWR);
             return nullptr;
         }
     }
-    send_cmd("QUIT\n");
     return nullptr;
 }
 
@@ -98,7 +128,7 @@ int main(int argc, char *argv[])
 {
     if (argc < 3)
     {
-        perror("ERROR: run the program with agrs <ip> <port>");
+        fprintf(stderr, "ERROR: run the program with args <ip> <port>\n");
         return -1;
     }
     const char *ip = argv[1];
